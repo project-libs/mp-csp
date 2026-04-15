@@ -1,0 +1,738 @@
+ROLE: You are a senior .NET security engineer specializing in Content Security Policy 
+(CSP) compliance for legacy ASP.NET WebForms 4.7.2 applications.
+
+OBJECTIVE: Achieve ZERO inline scripts across the entire codebase so the final CSP 
+header requires nothing except 'self' — no nonces, no hashes, no unsafe directives.
+Apply ALL changes in one complete pass. Do not stop midway. Return final updated files only.
+Preserve the existing project folder and file structure exactly as-is.
+
+TARGET CSP HEADER (this is your definition of done):
+═══════════════════════════════════════════════════
+Content-Security-Policy:
+  default-src  'self';
+  script-src   'self';
+  style-src    'self';
+  img-src      'self' data:;
+  font-src     'self';
+  connect-src  'self';
+  frame-ancestors 'none';
+  form-action  'self';
+  base-uri     'self';
+═══════════════════════════════════════════════════
+No 'unsafe-inline'. No 'unsafe-eval'. No nonces. No hashes. Nothing except 'self'.
+If the above header would cause any page to break, that is a violation to fix —
+not a reason to weaken the header.
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 1 — FULL CODEBASE DISCOVERY
+Scan before touching a single file
+═══════════════════════════════════════════════════════════════════════
+
+Scan every file matching: *.aspx, *.ascx, *.master, *.html, *.cs, *.js, *.config
+
+Build a complete violation inventory across these categories:
+
+[V1]  Inline <script> blocks in .aspx / .ascx / .master files
+[V2]  Inline event handlers on any element or ASP.NET control:
+        onclick, onchange, onsubmit, onfocus, onblur,
+        onkeyup, onkeydown, onkeypress, onmouseover,
+        onmouseout, onload, onerror, ondblclick
+[V3]  javascript: href or src values
+[V4]  <asp:GridView>, <asp:LinkButton>, <asp:ImageButton>,
+      <asp:Button UseSubmitBehavior="false"> or any control
+      that emits __doPostBack() or WebForm_DoPostBackWithOptions() at runtime
+[V5]  <asp:ScriptManager>, <asp:UpdatePanel> blocks that
+      inject inline scripts into the response
+[V6]  RegisterStartupScript() / RegisterClientScriptBlock() /
+      RegisterClientScriptInclude() calls in any .cs file
+[V7]  eval(), new Function(), setTimeout("string"),
+      setInterval("string") anywhere in .js files
+[V8]  <script> or <link> tags loading from external CDN
+      without SRI integrity + crossorigin attributes
+[V9]  Response.Write() calls that emit <script> blocks
+[V10] Any ScriptManager.RegisterStartupScript() /
+      ScriptManager.RegisterClientScriptBlock() static calls
+[V11] Inline <style> blocks (flag, do not auto-remove —
+      list for manual review)
+[V12] style= inline attributes (flag only, list for manual review)
+
+Output the full inventory table before proceeding to Phase 2:
+| # | File | Line | Category | Violation (truncated to 80 chars) |
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 2 — SERVER VALUE BRIDGE PATTERN
+Apply this pattern FIRST before all other transformations
+═══════════════════════════════════════════════════════════════════════
+
+This is the foundation of Option B. Every server-side value that was
+previously injected into inline scripts must be moved to data- attributes
+on a container element in the markup. The external JS then reads from there.
+
+RULE: No server value may ever be written into a <script> block.
+      All server → client data transfer happens through data- attributes only.
+
+FILE PLACEMENT RULE:
+      When a .aspx page already has a corresponding .js file anywhere
+      in the existing project, add all new JS code to that existing file.
+      When no .js file exists for a page, create the new .js file in the
+      same folder as the .aspx file and mirror the existing naming
+      convention used elsewhere in the project.
+      Never move, rename, or reorganise any existing file or folder.
+
+── PATTERN: Single page config element ──
+
+In the .aspx markup, place this once near the top of the content area:
+
+  <div id="page-config"
+       data-return-url="<%=ResolveUrl("~/Default.aspx") %>"
+       data-user-id="<%=CurrentUserId %>"
+       data-is-admin="<%=IsAdmin.ToString().ToLower() %>"
+       data-grid-page-size="<%=GridPageSize %>"
+       data-sort-field="<%=SortField %>"
+       data-sort-direction="<%=SortDirection %>"
+       data-api-base="<%=ResolveUrl("~/api/") %>"
+       style="display:none">
+  </div>
+
+In the external JS, read all values once at startup:
+
+  document.addEventListener('DOMContentLoaded', function () {
+      var cfg = document.getElementById('page-config').dataset;
+
+      var returnUrl  = cfg.returnUrl;
+      var userId     = cfg.userId;
+      var isAdmin    = cfg.isAdmin === 'true';
+      var pageSize   = parseInt(cfg.gridPageSize, 10);
+      var apiBase    = cfg.apiBase;
+  });
+
+── PATTERN: Per-row data in GridView / Repeater ──
+
+In the GridView TemplateField or Repeater ItemTemplate:
+
+  <button type="button"
+          class="btn-delete"
+          data-id="<%# Eval("ID") %>"
+          data-name="<%# Eval("Name") %>"
+          data-confirm='<%# "Delete " + Eval("Name") + "?" %>'>
+      Delete
+  </button>
+
+In external JS, read from the element that was clicked:
+
+  container.addEventListener('click', function (e) {
+      var btn = e.target.closest('.btn-delete');
+      if (!btn) return;
+      var id      = btn.dataset.id;
+      var name    = btn.dataset.name;
+      var message = btn.dataset.confirm;
+  });
+
+Apply this data- bridge pattern to EVERY place server values were
+previously written inline before proceeding to Phase 3.
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 3 — TRANSFORMATION RULES
+Apply every rule to every violation found in Phase 1
+═══════════════════════════════════════════════════════════════════════
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R1 — Inline <script> blocks  [fixes V1]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  BEFORE (in .aspx):
+    <script type="text/javascript">
+        var pageSize = <%=PageSize %>;
+        function deleteItem(id) { ... }
+    </script>
+
+  AFTER:
+    Step 1 — Remove the entire <script> block from the .aspx file.
+    Step 2 — Move all logic into the existing paired .js file for
+              this page. If none exists, create one beside the .aspx
+              using the same naming convention already in the project.
+    Step 3 — Replace all server value references with data- attribute
+              reads per the Phase 2 bridge pattern.
+    Step 4 — Add ONE external script reference at the bottom of the page
+              just before </body> or in the appropriate ContentPlaceHolder:
+                <script src="[relative path to paired .js file]"></script>
+
+  MERGING RULE: If a page has multiple inline script blocks,
+  merge all into the single paired .js file in document order.
+  Wrap in DOMContentLoaded where execution was previously deferred.
+
+  DO NOT create a new file if a paired .js file already exists —
+  append the moved code to the bottom of the existing file instead.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R2 — Inline event handlers  [fixes V2]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  BEFORE:
+    <asp:Button ID="btnSave" runat="server"
+                onclick="return validateForm();"
+                OnClick="btnSave_Click" />
+
+    <input type="text" id="txtSearch"
+           onkeyup="filterGrid(this.value)" />
+
+  AFTER — remove ALL on* attributes from the markup:
+    <asp:Button ID="btnSave" runat="server" OnClick="btnSave_Click" />
+
+    <input type="text" id="txtSearch" />
+
+  In the paired .js file — wire with addEventListener:
+    document.addEventListener('DOMContentLoaded', function () {
+
+        var btnSave = document.getElementById('<%= btnSave.ClientID %>');
+        if (btnSave) {
+            btnSave.addEventListener('click', function (e) {
+                if (!validateForm()) e.preventDefault();
+            });
+        }
+
+        var txtSearch = document.getElementById('txtSearch');
+        if (txtSearch) {
+            txtSearch.addEventListener('keyup', function () {
+                filterGrid(this.value);
+            });
+        }
+    });
+
+  FOR DYNAMICALLY RENDERED ROWS (GridView / Repeater) — use delegation:
+    var grid = document.getElementById('MainGridContainer');
+    if (grid) {
+        grid.addEventListener('click', function (e) {
+            var target = e.target.closest('[data-action]');
+            if (!target) return;
+            e.preventDefault();
+            handleGridAction(target.dataset.action, target.dataset.id);
+        });
+    }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R3 — javascript: href values  [fixes V3]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  BEFORE:
+    <a href="javascript:openModal('<%=ItemId %>')">View</a>
+    <a href="javascript:void(0)" onclick="doSomething()">Click</a>
+
+  AFTER:
+    <a href="#"
+       class="open-modal"
+       data-item-id="<%=ItemId %>">View</a>
+
+    <a href="#"
+       class="do-something">Click</a>
+
+  In the paired .js file:
+    document.addEventListener('click', function (e) {
+        var modal = e.target.closest('.open-modal');
+        if (modal) {
+            e.preventDefault();
+            openModal(modal.dataset.itemId);
+        }
+
+        var action = e.target.closest('.do-something');
+        if (action) {
+            e.preventDefault();
+            doSomething();
+        }
+    });
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R4 — __doPostBack emitters  [fixes V4]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  __doPostBack must be completely eliminated.
+  Replace every postback-triggering control with a fetch() call
+  to an .ashx handler placed in the same folder as the existing
+  handler files in the project, or beside the .aspx if no handler
+  folder exists.
+
+  ── SUB-RULE R4a: asp:LinkButton / asp:ImageButton in GridView ──
+
+  BEFORE:
+    <asp:TemplateField>
+        <ItemTemplate>
+            <asp:LinkButton ID="lnkEdit" runat="server"
+                            CommandName="Edit"
+                            CommandArgument='<%# Eval("ID") %>'
+                            OnClick="lnkEdit_Click">Edit</asp:LinkButton>
+            <asp:LinkButton ID="lnkDelete" runat="server"
+                            CommandName="Delete"
+                            CommandArgument='<%# Eval("ID") %>'
+                            OnClick="lnkDelete_Click">Delete</asp:LinkButton>
+        </ItemTemplate>
+    </asp:TemplateField>
+
+  AFTER — replace with plain HTML elements carrying data attributes:
+    <asp:TemplateField>
+        <ItemTemplate>
+            <a href="#"
+               class="grid-action"
+               data-action="edit"
+               data-id='<%# Eval("ID") %>'
+               data-name='<%# Eval("Name") %>'>Edit</a>
+
+            <a href="#"
+               class="grid-action"
+               data-action="delete"
+               data-id='<%# Eval("ID") %>'
+               data-confirm='<%# "Delete " + Eval("Name") + "?" %>'>Delete</a>
+        </ItemTemplate>
+    </asp:TemplateField>
+
+  Create [ExistingHandlerFolder]/GridActionHandler.ashx.cs:
+    public class GridActionHandler : IHttpHandler
+    {
+        public void ProcessRequest(HttpContext context)
+        {
+            string action = context.Request.Form["action"];
+            int    id     = int.Parse(context.Request.Form["id"]);
+
+            object result;
+            switch (action)
+            {
+                case "delete":
+                    YourService.Delete(id);
+                    result = new { success = true };
+                    break;
+                case "edit":
+                    var item = YourService.GetById(id);
+                    result = new { success = true, data = item };
+                    break;
+                default:
+                    context.Response.StatusCode = 400;
+                    result = new { success = false, error = "Unknown action" };
+                    break;
+            }
+
+            context.Response.ContentType = "application/json";
+            context.Response.Write(JsonConvert.SerializeObject(result));
+        }
+
+        public bool IsReusable => false;
+    }
+
+  In the paired .js file — wire the fetch calls:
+    document.addEventListener('DOMContentLoaded', function () {
+        var cfg  = document.getElementById('page-config').dataset;
+        var grid = document.getElementById('GridViewContainer');
+        if (!grid) return;
+
+        grid.addEventListener('click', function (e) {
+            var btn = e.target.closest('.grid-action');
+            if (!btn) return;
+            e.preventDefault();
+
+            var action  = btn.dataset.action;
+            var id      = btn.dataset.id;
+            var confirm = btn.dataset.confirm;
+
+            if (confirm && !window.confirm(confirm)) return;
+
+            var form = new FormData();
+            form.append('action', action);
+            form.append('id', id);
+
+            fetch(cfg.apiBase + 'GridActionHandler.ashx', {
+                method: 'POST',
+                body: form
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+                if (res.success) {
+                    if (action === 'delete') {
+                        btn.closest('tr').remove();
+                    }
+                    if (action === 'edit') {
+                        populateEditForm(res.data);
+                    }
+                }
+            })
+            .catch(function (err) {
+                console.error('Action failed:', err);
+            });
+        });
+    });
+
+  ── SUB-RULE R4b: asp:Button with UseSubmitBehavior="false" ──
+
+  BEFORE:
+    <asp:Button ID="btnSort" runat="server"
+                UseSubmitBehavior="false"
+                OnClick="btnSort_Click"
+                Text="Sort" />
+
+  AFTER:
+    <button type="button"
+            class="sort-btn"
+            data-field="<%=SortField %>"
+            data-direction="<%=SortDirection %>">Sort</button>
+
+  ── SUB-RULE R4c: asp:GridView built-in Sort / Page commands ──
+
+  BEFORE:
+    <asp:GridView ID="gvData" runat="server"
+                  AllowSorting="true"
+                  AllowPaging="true"
+                  OnSorting="gvData_Sorting"
+                  OnPageIndexChanging="gvData_PageIndexChanging" />
+
+  AFTER — disable built-in sort/page, replace with plain HTML links:
+    <asp:GridView ID="gvData" runat="server"
+                  AllowSorting="false"
+                  AllowPaging="false" />
+
+  Render sort headers manually in a TemplateField:
+    <a href="#"
+       class="sort-header"
+       data-field="Name"
+       data-direction="ASC">Name</a>
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R5 — ScriptManager / UpdatePanel  [fixes V5]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  UpdatePanel is fundamentally incompatible with strict CSP.
+  Remove ALL <asp:UpdatePanel> blocks.
+  Replace with fetch() + DOM replacement.
+
+  BEFORE:
+    <asp:UpdatePanel ID="upGrid" runat="server">
+        <ContentTemplate>
+            <asp:GridView ID="gvData" runat="server" ... />
+        </ContentTemplate>
+        <Triggers>
+            <asp:AsyncPostBackTrigger ControlID="btnRefresh" />
+        </Triggers>
+    </asp:UpdatePanel>
+    <asp:Button ID="btnRefresh" runat="server" Text="Refresh"
+                OnClick="btnRefresh_Click" />
+
+  AFTER — markup:
+    <div id="grid-container">
+        <asp:GridView ID="gvData" runat="server" ... />
+    </div>
+    <button type="button"
+            id="btnRefresh"
+            class="refresh-btn">Refresh</button>
+
+  Create handler beside existing handlers in the project:
+    public void ProcessRequest(HttpContext context)
+    {
+        var data = YourService.GetGridData();
+        var sb   = new StringBuilder();
+
+        foreach (var row in data)
+        {
+            sb.AppendFormat(
+                "<tr><td>{0}</td><td>{1}</td>" +
+                "<td><a href='#' class='grid-action' " +
+                "data-action='edit' data-id='{2}'>Edit</a></td></tr>",
+                row.Name, row.Status, row.ID);
+        }
+
+        context.Response.ContentType = "text/html";
+        context.Response.Write(sb.ToString());
+    }
+
+  In the paired .js file:
+    document.getElementById('btnRefresh')
+        .addEventListener('click', function () {
+            fetch('/Handlers/GridRefreshHandler.ashx')
+                .then(function (r) { return r.text(); })
+                .then(function (html) {
+                    document.querySelector(
+                        '#grid-container tbody').innerHTML = html;
+                });
+        });
+
+  Remove <asp:ScriptManager> if its only purpose was supporting
+  UpdatePanel. If needed for other controls, confirm it does not
+  emit inline scripts — if it does, remove it and reference the
+  relevant scripts directly with <script src="..."> tags.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R6 — RegisterStartupScript  [fixes V6, V10]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  BEFORE (in code-behind):
+    protected void Page_Load(object sender, EventArgs e)
+    {
+        string script = $@"
+            var selectedId = {SelectedId};
+            var mode = '{EditMode}';
+            initializeForm(selectedId, mode);
+        ";
+        ClientScript.RegisterStartupScript(
+            this.GetType(), "initForm", script, true);
+    }
+
+  AFTER:
+  Step 1 — Write server values to data- attributes in the .aspx:
+    <div id="form-config"
+         data-selected-id="<%=SelectedId %>"
+         data-mode="<%=EditMode %>"
+         style="display:none">
+    </div>
+
+  Step 2 — Remove the RegisterStartupScript call from .cs entirely.
+            In the paired .js file:
+    document.addEventListener('DOMContentLoaded', function () {
+        var cfg = document.getElementById('form-config').dataset;
+        initializeForm(parseInt(cfg.selectedId, 10), cfg.mode);
+    });
+
+  FOR DYNAMIC MESSAGES (toasts / alerts):
+  BEFORE:
+    ScriptManager.RegisterStartupScript(this, this.GetType(),
+        "toast", "showToast('Record saved');", true);
+
+  AFTER — write to hidden fields in markup:
+    <input type="hidden" id="toastMessage"
+           runat="server" ClientIDMode="Static" />
+    <input type="hidden" id="toastType"
+           runat="server" ClientIDMode="Static" />
+
+    // In code-behind — set the values:
+    toastMessage.Value = "Record saved";
+    toastType.Value    = "success";
+
+    // In paired .js file — read on load:
+    document.addEventListener('DOMContentLoaded', function () {
+        var msg  = document.getElementById('toastMessage').value;
+        var type = document.getElementById('toastType').value;
+        if (msg) showToast(msg, type);
+    });
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R7 — eval / unsafe JS patterns  [fixes V7]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  eval(expression)          → named function, called directly
+  new Function(string)      → named function, called directly
+  setTimeout("codeString")  → setTimeout(namedFunction, delay)
+  setInterval("codeString") → setInterval(namedFunction, delay)
+
+  BEFORE:
+    eval("processData(" + jsonString + ")");
+    setTimeout("refreshGrid()", 5000);
+
+  AFTER:
+    processData(JSON.parse(jsonString));
+    setTimeout(refreshGrid, 5000);
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R8 — External CDN scripts  [fixes V8]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  PREFERRED: Download CDN libraries and place them where the existing
+  vendor / lib scripts already live in the project.
+  Serve them locally — no CDN domain needed in the CSP header.
+
+  IF LOCAL HOSTING IS NOT POSSIBLE — add SRI:
+    <script src="https://cdn.example.com/jquery-3.7.1.min.js"
+            integrity="sha384-[hash]"
+            crossorigin="anonymous"></script>
+
+  And extend the CSP header accordingly:
+    script-src 'self' https://cdn.example.com
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE R9 — Response.Write script blocks  [fixes V9]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  BEFORE:
+    Response.Write("<script>alert('Session expired');</script>");
+
+  AFTER — signal via hidden field, read in paired .js:
+    // In .cs:
+    Session["ShowSessionWarning"] = true;
+
+    // In .aspx:
+    <input type="hidden" id="sessionWarning"
+           value="<%=Session["ShowSessionWarning"] != null
+                      ? "true" : "" %>"
+           runat="server" ClientIDMode="Static" />
+
+    // In paired .js:
+    var warning = document.getElementById('sessionWarning');
+    if (warning && warning.value === 'true') {
+        showSessionExpiredModal();
+    }
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 4 — CSP HEADER MODULE
+Static header — no nonce, no hash, no dynamic generation needed
+═══════════════════════════════════════════════════════════════════════
+
+Since there are zero inline scripts after Phase 3, the CSP header
+is a simple static value.
+
+── OPTION 4A: Web.config (use this by default) ──
+
+  <system.webServer>
+    <httpProtocol>
+      <customHeaders>
+        <add name="Content-Security-Policy"
+             value="default-src 'self';
+                    script-src 'self';
+                    style-src 'self';
+                    img-src 'self' data:;
+                    font-src 'self';
+                    connect-src 'self';
+                    frame-ancestors 'none';
+                    form-action 'self';
+                    base-uri 'self';" />
+        <add name="X-Content-Type-Options" value="nosniff" />
+        <add name="X-Frame-Options" value="DENY" />
+        <add name="X-XSS-Protection" value="1; mode=block" />
+        <add name="Referrer-Policy" value="strict-origin-when-cross-origin" />
+      </customHeaders>
+    </httpProtocol>
+  </system.webServer>
+
+── OPTION 4B: HttpModule (use only if per-path variation is needed) ──
+
+  Place CspHeaderModule.cs in the same folder as other HttpModule
+  or App_Code files already in the project. Do not create new folders.
+
+    public class CspHeaderModule : IHttpModule
+    {
+        private const string CspHeader =
+            "default-src 'self'; " +
+            "script-src 'self'; " +
+            "style-src 'self'; " +
+            "img-src 'self' data:; " +
+            "font-src 'self'; " +
+            "connect-src 'self'; " +
+            "frame-ancestors 'none'; " +
+            "form-action 'self'; " +
+            "base-uri 'self';";
+
+        public void Init(HttpApplication app)
+        {
+            app.PreSendRequestHeaders += OnPreSendRequestHeaders;
+        }
+
+        private void OnPreSendRequestHeaders(object sender, EventArgs e)
+        {
+            var app = (HttpApplication)sender;
+            app.Response.Headers.Set("Content-Security-Policy", CspHeader);
+        }
+
+        public void Dispose() { }
+    }
+
+  Register in Web.config:
+    <system.webServer>
+      <modules>
+        <add name="CspHeaderModule" type="CspHeaderModule" />
+      </modules>
+    </system.webServer>
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 5 — VALIDATION CHECKLIST
+Run this before declaring completion
+═══════════════════════════════════════════════════════════════════════
+
+For every .aspx, .ascx, .master file confirm:
+  [ ] Zero <script> blocks without a src= attribute
+  [ ] Zero on* event handler attributes on any element
+  [ ] Zero javascript: href or src values
+  [ ] Zero <asp:UpdatePanel> blocks remaining
+  [ ] Zero <asp:ScriptManager> blocks remaining
+       (unless confirmed to not emit inline scripts)
+  [ ] Zero RegisterStartupScript calls in code-behind
+  [ ] Zero RegisterClientScriptBlock calls in code-behind
+  [ ] Zero Response.Write calls emitting <script> tags
+
+For every .js file confirm:
+  [ ] Zero eval() calls
+  [ ] Zero new Function() calls
+  [ ] Zero setTimeout("string") calls
+  [ ] Zero setInterval("string") calls
+
+For Web.config / HttpModule confirm:
+  [ ] CSP header is present
+  [ ] CSP header contains NO unsafe-inline
+  [ ] CSP header contains NO unsafe-eval
+  [ ] CSP header contains NO nonce-
+  [ ] CSP header contains NO sha256- / sha384- / sha512-
+
+
+═══════════════════════════════════════════════════════════════════════
+OUTPUT CONTRACT
+Return these artifacts and nothing else
+═══════════════════════════════════════════════════════════════════════
+
+Do NOT stop between phases.
+Do NOT ask clarifying questions — make the safest architectural choice
+and document it in section 3 below.
+Do NOT move, rename, or reorganise any existing file or folder.
+Complete all 5 phases then return:
+
+① VIOLATION INVENTORY
+   Full table from Phase 1 with a Fix Applied column added.
+
+② UPDATED FILES — full content, no diffs, no partial snippets:
+   • Every modified .aspx / .ascx / .master
+   • Every modified .cs code-behind
+   • Every new or modified .ashx + .ashx.cs handler
+     placed in the same folder as existing handlers
+   • Every new or modified .js file
+     placed beside its paired .aspx or in the existing JS folder
+   • Web.config (updated)
+   • CspHeaderModule.cs if Option 4B was chosen,
+     placed in the same folder as existing modules or App_Code
+
+③ REMAINING MANUAL ITEMS
+   Items requiring human decision — do not block on these:
+   • Inline style= attributes flagged as V12
+   • Inline <style> blocks flagged as V11
+   • Any third-party library with known eval() usage
+     (list library name + recommended CSP-safe version)
+   • Any GridView sort/page pattern too complex to auto-convert
+     (describe the control and recommended manual approach)
+
+④ FINAL CSP HEADER
+   Print the exact header string that was applied.
+   Confirm it contains no unsafe directives whatsoever.
+
+
+═══════════════════════════════════════════════════════════════════════
+ABSOLUTE CONSTRAINTS — NEVER VIOLATE THESE
+═══════════════════════════════════════════════════════════════════════
+
+✗ Never output unsafe-inline in the CSP header
+✗ Never output unsafe-eval in the CSP header
+✗ Never leave any inline on* handler in final markup
+✗ Never leave any <script> block without a src= attribute
+✗ Never leave any __doPostBack emitting control in final markup
+✗ Never leave any UpdatePanel in final markup
+✗ Never leave any RegisterStartupScript call in final .cs files
+✗ Never leave any RegisterClientScriptBlock call in final .cs files
+✗ Never leave any Response.Write emitting a <script> tag
+✗ Do not move, rename, or reorganise any existing file or folder
+✗ Do not create new folders — place new files beside existing
+  files of the same type following the project's own conventions
+✗ Do not change server-side business logic — only JS wiring
+✗ Do not change database access, service calls, or validation logic
+✗ Target framework stays .NET 4.7.2 — no newer APIs
+✗ Do not stop mid-task to ask questions

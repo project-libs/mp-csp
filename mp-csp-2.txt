@@ -249,13 +249,35 @@ RULE R3 — javascript: href values  [fixes V3]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE R4 — __doPostBack emitters  [fixes V4]
+Replace ALL postback-triggering controls with [WebMethod] + fetch()
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  __doPostBack must be completely eliminated.
-  Replace every postback-triggering control with a fetch() call
-  to an .ashx handler placed in the same folder as the existing
-  handler files in the project, or beside the .aspx if no handler
-  folder exists.
+__doPostBack must be completely eliminated.
+Every postback-triggering control is replaced with:
+  • A plain HTML element carrying data- attributes (no ASP.NET control)
+  • A [WebMethod] on the same page's code-behind (.cs)
+  • A fetch() call in the paired .js file
+
+WEBMETHOD RULES:
+  ✓ Must be public static
+  ✓ Must be decorated with [WebMethod]
+  ✓ Must be decorated with [ScriptMethod(UseHttpGet = false)]
+  ✓ The page must have [ScriptManager] removed and instead have
+    ScriptService enabled via [System.Web.Services.ScriptService]
+    on a dedicated service OR called directly via fetch() with
+    Content-Type: application/json
+  ✓ Return types must be JSON-serializable
+  ✓ Never return ScriptManager partial render responses
+  ✓ Always decorate the page code-behind class with
+    [System.Web.Script.Services.ScriptService] if WebMethods
+    live on the page itself
+
+FETCH → WEBMETHOD CALLING CONVENTION:
+  WebMethods on a page are called at:
+    POST /PageName.aspx/MethodName
+  Content-Type must be: application/json
+  Body must be a JSON object matching the method's parameter names exactly.
+
 
   ── SUB-RULE R4a: asp:LinkButton / asp:ImageButton in GridView ──
 
@@ -266,6 +288,7 @@ RULE R4 — __doPostBack emitters  [fixes V4]
                             CommandName="Edit"
                             CommandArgument='<%# Eval("ID") %>'
                             OnClick="lnkEdit_Click">Edit</asp:LinkButton>
+
             <asp:LinkButton ID="lnkDelete" runat="server"
                             CommandName="Delete"
                             CommandArgument='<%# Eval("ID") %>'
@@ -273,7 +296,7 @@ RULE R4 — __doPostBack emitters  [fixes V4]
         </ItemTemplate>
     </asp:TemplateField>
 
-  AFTER — replace with plain HTML elements carrying data attributes:
+  AFTER — markup, replace with plain HTML elements:
     <asp:TemplateField>
         <ItemTemplate>
             <a href="#"
@@ -290,39 +313,60 @@ RULE R4 — __doPostBack emitters  [fixes V4]
         </ItemTemplate>
     </asp:TemplateField>
 
-  Create [ExistingHandlerFolder]/GridActionHandler.ashx.cs:
-    public class GridActionHandler : IHttpHandler
+  AFTER — code-behind, add WebMethods to the page class:
+
+    using System.Web.Services;
+    using System.Web.Script.Services;
+
+    [ScriptService]
+    public partial class YourPage : System.Web.UI.Page
     {
-        public void ProcessRequest(HttpContext context)
+        // Existing Page_Load and other server methods stay untouched
+
+        [WebMethod]
+        [ScriptMethod(UseHttpGet = false)]
+        public static object DeleteItem(int id)
         {
-            string action = context.Request.Form["action"];
-            int    id     = int.Parse(context.Request.Form["id"]);
-
-            object result;
-            switch (action)
+            try
             {
-                case "delete":
-                    YourService.Delete(id);
-                    result = new { success = true };
-                    break;
-                case "edit":
-                    var item = YourService.GetById(id);
-                    result = new { success = true, data = item };
-                    break;
-                default:
-                    context.Response.StatusCode = 400;
-                    result = new { success = false, error = "Unknown action" };
-                    break;
+                // Call your existing BLL/DAL method — do not change it
+                YourService.Delete(id);
+                return new { success = true };
             }
-
-            context.Response.ContentType = "application/json";
-            context.Response.Write(JsonConvert.SerializeObject(result));
+            catch (Exception ex)
+            {
+                return new { success = false, error = ex.Message };
+            }
         }
 
-        public bool IsReusable => false;
+        [WebMethod]
+        [ScriptMethod(UseHttpGet = false)]
+        public static object GetItem(int id)
+        {
+            try
+            {
+                var item = YourService.GetById(id);
+                return new
+                {
+                    success = true,
+                    data = new
+                    {
+                        item.ID,
+                        item.Name,
+                        item.Status
+                        // map only the fields the JS needs
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new { success = false, error = ex.Message };
+            }
+        }
     }
 
-  In the paired .js file — wire the fetch calls:
+  AFTER — paired .js file, wire fetch to WebMethod:
+
     document.addEventListener('DOMContentLoaded', function () {
         var cfg  = document.getElementById('page-config').dataset;
         var grid = document.getElementById('GridViewContainer');
@@ -333,36 +377,36 @@ RULE R4 — __doPostBack emitters  [fixes V4]
             if (!btn) return;
             e.preventDefault();
 
-            var action  = btn.dataset.action;
-            var id      = btn.dataset.id;
-            var confirm = btn.dataset.confirm;
+            var action      = btn.dataset.action;
+            var id          = parseInt(btn.dataset.id, 10);
+            var confirmMsg  = btn.dataset.confirm;
 
-            if (confirm && !window.confirm(confirm)) return;
+            if (confirmMsg && !window.confirm(confirmMsg)) return;
 
-            var form = new FormData();
-            form.append('action', action);
-            form.append('id', id);
+            if (action === 'delete') {
+                callWebMethod('DeleteItem', { id: id }, cfg.pageUrl)
+                    .then(function (res) {
+                        if (res.success) {
+                            btn.closest('tr').remove();
+                        } else {
+                            showError(res.error);
+                        }
+                    });
+            }
 
-            fetch(cfg.apiBase + 'GridActionHandler.ashx', {
-                method: 'POST',
-                body: form
-            })
-            .then(function (r) { return r.json(); })
-            .then(function (res) {
-                if (res.success) {
-                    if (action === 'delete') {
-                        btn.closest('tr').remove();
-                    }
-                    if (action === 'edit') {
-                        populateEditForm(res.data);
-                    }
-                }
-            })
-            .catch(function (err) {
-                console.error('Action failed:', err);
-            });
+            if (action === 'edit') {
+                callWebMethod('GetItem', { id: id }, cfg.pageUrl)
+                    .then(function (res) {
+                        if (res.success) {
+                            populateEditForm(res.data);
+                        } else {
+                            showError(res.error);
+                        }
+                    });
+            }
         });
     });
+
 
   ── SUB-RULE R4b: asp:Button with UseSubmitBehavior="false" ──
 
@@ -372,11 +416,58 @@ RULE R4 — __doPostBack emitters  [fixes V4]
                 OnClick="btnSort_Click"
                 Text="Sort" />
 
-  AFTER:
+  AFTER — markup:
     <button type="button"
             class="sort-btn"
-            data-field="<%=SortField %>"
-            data-direction="<%=SortDirection %>">Sort</button>
+            data-field="Name"
+            data-direction="ASC">Sort</button>
+
+  AFTER — code-behind WebMethod:
+    [WebMethod]
+    [ScriptMethod(UseHttpGet = false)]
+    public static object SortGrid(string field, string direction)
+    {
+        try
+        {
+            var data = YourService.GetSorted(field, direction);
+            return new
+            {
+                success = true,
+                rows = data.Select(r => new
+                {
+                    r.ID,
+                    r.Name,
+                    r.Status
+                }).ToList()
+            };
+        }
+        catch (Exception ex)
+        {
+            return new { success = false, error = ex.Message };
+        }
+    }
+
+  AFTER — paired .js:
+    document.querySelectorAll('.sort-btn')
+        .forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var field     = btn.dataset.field;
+                var direction = btn.dataset.direction;
+
+                callWebMethod('SortGrid',
+                    { field: field, direction: direction },
+                    cfg.pageUrl)
+                .then(function (res) {
+                    if (res.success) {
+                        rebuildGridRows(res.rows);
+                        // Toggle direction for next click
+                        btn.dataset.direction =
+                            direction === 'ASC' ? 'DESC' : 'ASC';
+                    }
+                });
+            });
+        });
+
 
   ── SUB-RULE R4c: asp:GridView built-in Sort / Page commands ──
 
@@ -387,16 +478,129 @@ RULE R4 — __doPostBack emitters  [fixes V4]
                   OnSorting="gvData_Sorting"
                   OnPageIndexChanging="gvData_PageIndexChanging" />
 
-  AFTER — disable built-in sort/page, replace with plain HTML links:
+  AFTER — disable built-in sort/page on the control:
     <asp:GridView ID="gvData" runat="server"
                   AllowSorting="false"
                   AllowPaging="false" />
 
-  Render sort headers manually in a TemplateField:
+  Render sort headers and pager manually in TemplateFields:
+    <%-- Sort header --%>
     <a href="#"
        class="sort-header"
        data-field="Name"
        data-direction="ASC">Name</a>
+
+    <%-- Pager controls --%>
+    <div id="pager-controls"
+         data-current-page="<%=CurrentPage %>"
+         data-total-pages="<%=TotalPages %>">
+        <button type="button"
+                class="pager-btn"
+                data-page="prev">Previous</button>
+        <button type="button"
+                class="pager-btn"
+                data-page="next">Next</button>
+    </div>
+
+  AFTER — code-behind WebMethod for paging:
+    [WebMethod]
+    [ScriptMethod(UseHttpGet = false)]
+    public static object GetPage(int pageIndex, int pageSize,
+                                 string sortField, string sortDirection)
+    {
+        try
+        {
+            var result = YourService.GetPaged(
+                pageIndex, pageSize, sortField, sortDirection);
+
+            return new
+            {
+                success    = true,
+                rows       = result.Rows.Select(r => new
+                             {
+                                 r.ID, r.Name, r.Status
+                             }).ToList(),
+                totalPages = result.TotalPages,
+                currentPage = result.CurrentPage
+            };
+        }
+        catch (Exception ex)
+        {
+            return new { success = false, error = ex.Message };
+        }
+    }
+
+
+  ── SHARED WEBMETHOD FETCH HELPER ──
+
+  Add this helper function to your shared utils .js file
+  (or at the top of each paired .js file if no shared file exists).
+  This is the single function all WebMethod calls go through:
+
+    /**
+     * Call an ASP.NET WebMethod on the current page.
+     * @param {string} methodName  - Exact method name as defined in .cs
+     * @param {object} params      - Parameter object matching method signature
+     * @param {string} pageUrl     - Page URL from data-page-url on page-config
+     * @returns {Promise<object>}  - Parsed d property from WebMethod response
+     */
+    function callWebMethod(methodName, params, pageUrl) {
+        return fetch(pageUrl + '/' + methodName, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json; charset=utf-8'
+            },
+            body: JSON.stringify(params)
+        })
+        .then(function (response) {
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+            return response.json();
+        })
+        .then(function (data) {
+            // ASP.NET WebMethod wraps the return value in a "d" property
+            // This is a security feature — always unwrap it here
+            return data.d;
+        })
+        .catch(function (err) {
+            console.error('WebMethod call failed [' + methodName + ']:', err);
+            throw err;
+        });
+    }
+
+  Add the page URL to the page-config data- element in every .aspx:
+    <div id="page-config"
+         data-page-url="<%=ResolveUrl(Request.Url.AbsolutePath) %>"
+         data-api-base="<%=ResolveUrl("~/") %>"
+         ...other values...
+         style="display:none">
+    </div>
+
+
+  ── WEBMETHOD SECURITY CHECKLIST ──
+
+  Apply these checks to every WebMethod added:
+
+  [ ] Method is public static — required by ASP.NET WebMethod runtime
+  [ ] Decorated with [WebMethod] and [ScriptMethod(UseHttpGet = false)]
+  [ ] Page class is decorated with [ScriptService]
+  [ ] Input parameters are validated before use:
+        if (id <= 0) return new { success = false, error = "Invalid ID" };
+  [ ] No method accepts raw SQL, HTML, or JavaScript as a parameter
+  [ ] Return object never exposes internal exception stack traces
+        in production — catch and return a safe error message only
+  [ ] Method does not bypass existing authorisation checks —
+        if the server event previously checked Page.User.IsInRole(),
+        add the same check at the top of the WebMethod:
+          if (!HttpContext.Current.User.IsInRole("Admin"))
+              return new { success = false, error = "Unauthorised" };
+  [ ] Session state is available if needed via:
+        HttpContext.Current.Session["key"]
+  [ ] ViewState is NOT available inside a static WebMethod —
+        if the original postback handler read ViewState,
+        pass those values as explicit parameters from JS instead
+        using data- attributes on the triggering element
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

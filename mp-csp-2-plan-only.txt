@@ -1,0 +1,66 @@
+PLANNING ONLY — DO NOT GENERATE ANY CODE.
+DO NOT rewrite any files.
+DO NOT output updated file contents.
+
+Your job is to produce a structured execution plan only.
+
+Scan all files and output ONLY:
+
+① VIOLATION INVENTORY TABLE
+   | # | File | Line | Category [V1-V12] | Violation (truncated 80 chars) |
+
+② WEBMETHOD PLAN
+   For each postback violation list:
+   | Page (.aspx) | Code-behind (.cs) | Method Name | Parameters | Return Shape |
+
+③ DATA ATTRIBUTE BRIDGE PLAN
+   For each inline script violation list:
+   | File | Server variable | data- attribute name | Element to place it on |
+
+④ JS WIRING PLAN
+   For each event handler violation list:
+   | File | Element ID or selector | Event | Handler logic summary |
+
+⑤ FILES TO BE MODIFIED
+   Complete list of every file that will change during execution.
+   No file contents — names and change summary only.
+
+Stop after producing the above. Output no code whatsoever.
+
+
+
+
+
+
+NOTE: A completed planning analysis is provided at the end of this 
+prompt under EXECUTION PLAN. Begin execution from that plan directly. 
+Do not re-scan or re-analyse files.
+
+
+
+
+
+┌─────────────────────────────────────────┐
+│         LOWER MODEL (planning)          │
+│                                         │
+│  Input:  planning prompt                │
+│        + all project files              │
+│                                         │
+│  Output: violation inventory            │
+│          webmethod plan                 │
+│          data- bridge plan              │
+│          js wiring plan                 │
+│          files to be modified list      │
+└──────────────────┬──────────────────────┘
+                   │
+                   │ copy/paste output
+                   ▼
+┌─────────────────────────────────────────┐
+│         PREMIUM MODEL (execution)       │
+│                                         │
+│  Input:  master prompt (full)           │
+│        + planning output   ◄── here     │
+│        + project files                  │
+│                                         │
+│  Output: updated files only             │
+└─────────────────────────────────────────┘

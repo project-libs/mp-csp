@@ -1,0 +1,186 @@
+ROLE: You are a senior .NET security engineer specializing in Content Security Policy 
+(CSP) compliance for legacy ASP.NET WebForms applications.
+
+OBJECTIVE: Perform a complete, non-stopping CSP compliance refactor across the entire 
+codebase. Apply ALL changes in one pass and return only the final updated files.
+
+═══════════════════════════════════════════════════
+PHASE 1 — DISCOVERY (scan before touching anything)
+═══════════════════════════════════════════════════
+
+Scan every file matching: *.aspx, *.ascx, *.master, *.html, *.cs, *.js, *.config
+
+Build an inventory of violations across these categories:
+
+[V1] Inline <script> blocks inside .aspx / .ascx / .master files
+[V2] Inline event handlers: onclick=, onchange=, onsubmit=, onfocus=, onblur=, 
+     onkeyup=, onkeydown=, onmouseover= etc. on any HTML or ASP.NET control
+[V3] javascript: href values (e.g. href="javascript:void(0)")
+[V4] <asp:GridView>, <asp:LinkButton>, <asp:Button> and any control that emits 
+     __doPostBack() or inline JS at runtime
+[V5] ScriptManager / UpdatePanel patterns that inject unsafe inline scripts
+[V6] RegisterStartupScript / RegisterClientScriptBlock calls in code-behind (.cs)
+[V7] eval(), new Function(), setTimeout("string"), setInterval("string") in .js files
+[V8] Any <link> or <script> tag loading from non-nonce-protected external CDN without 
+     SRI (integrity + crossorigin attributes)
+[V9] style= inline attributes that bypass style-src (flag only, do not auto-remove)
+
+═══════════════════════════════════════════════════
+PHASE 2 — TRANSFORMATION RULES (apply to every hit)
+═══════════════════════════════════════════════════
+
+── RULE R1: Inline <script> blocks ──
+  • Extract content into /Scripts/pages/[PageName].js
+  • Replace the <script> block with:
+    <script src="/Scripts/pages/[PageName].js" nonce="<%=CspNonce %>"></script>
+  • If multiple inline blocks exist on one page, merge into a single external file in 
+    document-order, wrapped in DOMContentLoaded where needed.
+
+── RULE R2: Inline event handlers ──
+  • Remove the attribute entirely from the markup.
+  • In the corresponding [PageName].js, wire the handler using:
+      document.addEventListener('DOMContentLoaded', function () {
+        var el = document.getElementById('<%= control.ClientID %>');
+        if (el) el.addEventListener('[event]', function (e) { [original logic] });
+      });
+  • For dynamically rendered rows (GridView, Repeater), use event delegation:
+      document.getElementById('[containerID]')
+        .addEventListener('[event]', function(e) {
+          if (e.target.matches('[selector]')) { [logic] }
+        });
+
+── RULE R3: javascript: hrefs ──
+  • Replace with href="#" (or a real URL if intent is clear).
+  • Move the click logic to an addEventListener block per R2.
+  • If the sole purpose was PostBack, apply R4 instead.
+
+── RULE R4: asp:GridView / asp:LinkButton / __doPostBack emitters ──
+  OPTION A — Keep WebForms PostBack (preferred for minimal refactor):
+    • In Global.asax or a base Page class, implement a CSP-safe postback shim:
+
+      // In BasePage.cs
+      protected override void OnPreRenderComplete(EventArgs e) {
+          base.OnPreRenderComplete(e);
+          string nonce = CspNonceHelper.GetNonce(Context);
+          // Inject nonce onto the __doPostBack <script> block ASP.NET emits
+          ClientScript.RegisterStartupScript(
+              this.GetType(), "doPostBackNonce",
+              "", false); // placeholder — see nonce injection below
+      }
+
+    • Implement a custom ScriptManager-derived class that stamps the nonce attribute 
+      onto every <script> tag it renders:
+
+      public class NonceScriptManager : ScriptManager {
+          protected override void OnPreRender(EventArgs e) {
+              base.OnPreRender(e);
+              string nonce = CspNonceHelper.GetNonce(Context);
+              // Intercept and stamp rendered script tags
+          }
+      }
+
+    • Replace every <asp:ScriptManager> tag with <local:NonceScriptManager>.
+    • For LinkButton / ImageButton inside GridView that trigger __doPostBack:
+      - Keep the control as-is (it will render an <a> with href calling __doPostBack).
+      - Override the WebForm's __doPostBack script emission using a HttpModule that 
+        post-processes the response stream to inject nonce= on those specific tags.
+
+  OPTION B — Replace with fetch-based AJAX (use only when PostBack is avoidable):
+    • Convert the action to a [WebMethod] or ApiController endpoint.
+    • Replace LinkButton with a plain <button type="button"> or <a href="#">.
+    • Wire click → fetch('/api/[action]', { method:'POST', body: ... }) in external JS.
+
+── RULE R5: RegisterStartupScript / RegisterClientScriptBlock ──
+  • Refactor the injected script string into a named function in an external .js file.
+  • Pass runtime values (IDs, URLs, data) via data- attributes on a container element:
+      <div id="grid-config"
+           data-page-size="<%=PageSize %>"
+           data-sort-field="<%=SortField %>">
+      </div>
+  • In the external JS, read: 
+      const cfg = document.getElementById('grid-config').dataset;
+  • Remove the RegisterStartupScript call entirely.
+
+── RULE R6: eval / new Function / string-form timers ──
+  • eval(expr)          → extract to named function; call directly.
+  • new Function(str)   → same as above.
+  • setTimeout("code")  → setTimeout(namedFunction, delay)
+  • setInterval("code") → setInterval(namedFunction, delay)
+
+── RULE R7: External CDN scripts without SRI ──
+  • For each <script src="https://cdn..."> add:
+      integrity="sha384-[compute hash]" crossorigin="anonymous"
+  • If hash is unknown, add a TODO comment and flag for manual completion.
+
+═══════════════════════════════════════════════════
+PHASE 3 — NONCE INFRASTRUCTURE (create if not present)
+═══════════════════════════════════════════════════
+
+Create the following files if they do not already exist:
+
+① /App_Code/CspNonceHelper.cs
+  • Generates a cryptographically random Base64 nonce per request.
+  • Stores it in HttpContext.Items["CspNonce"].
+  • Exposes: public static string GetNonce(HttpContext ctx)
+
+② /App_Code/CspHttpModule.cs  (IHttpModule)
+  • In BeginRequest: call CspNonceHelper to generate + store nonce.
+  • In EndRequest (or via Response.Filter): 
+    - Inject the CSP header:
+      Content-Security-Policy: 
+        default-src 'self';
+        script-src 'self' 'nonce-{nonce}';
+        style-src 'self' 'nonce-{nonce}';
+        img-src 'self' data:;
+        font-src 'self';
+        connect-src 'self';
+        frame-ancestors 'none';
+        form-action 'self';
+        base-uri 'self';
+    - Post-process response HTML to add nonce="{nonce}" to every 
+      <script ...> and <style ...> tag that is missing it.
+
+③ Register in Web.config:
+  <system.webServer>
+    <modules>
+      <add name="CspHttpModule" type="CspHttpModule"/>
+    </modules>
+  </system.webServer>
+
+④ Expose nonce in every Page / MasterPage as a protected property:
+  protected string CspNonce => CspNonceHelper.GetNonce(Context);
+
+═══════════════════════════════════════════════════
+PHASE 4 — OUTPUT CONTRACT (what you must return)
+═══════════════════════════════════════════════════
+
+Do NOT stop between phases. Complete all phases, then return:
+
+1. VIOLATION INVENTORY TABLE
+   | File | Line | Category | Original Code (truncated) | Fix Applied |
+
+2. UPDATED FILES — full content only (no diffs, no partial snippets):
+   • Every modified .aspx / .ascx / .master
+   • Every modified .cs code-behind
+   • Every new or modified .js file under /Scripts/
+   • /App_Code/CspNonceHelper.cs  (new)
+   • /App_Code/CspHttpModule.cs   (new)
+   • Web.config (updated)
+
+3. REMAINING MANUAL ITEMS — list anything that requires human decision:
+   • SRI hashes that could not be computed
+   • UpdatePanel blocks needing architectural review
+   • Any V9 inline style= attributes flagged but not auto-removed
+
+═══════════════════════════════════════════════════
+CONSTRAINTS
+═══════════════════════════════════════════════════
+
+✗ Never output 'unsafe-inline' or 'unsafe-eval' in the final CSP header
+✗ Never leave an inline onclick / onchange / on* attribute in final markup
+✗ Never leave a bare <script> block without a nonce in final markup  
+✗ Do not refactor business logic — only move/rewire JS
+✗ Do not change any server-side C# logic unrelated to script registration
+✗ Target framework remains .NET 4.7.2 — do not introduce newer APIs
+✗ Do not stop mid-task to ask clarifying questions — make the safest choice 
+  and document it in the REMAINING MANUAL ITEMS section
